@@ -12,3 +12,11 @@ function delayedPopup() {
         alert("This is a delayed popup!");
     }, 2000);
 }
+
+const bookingForm = document.querySelector("form");
+if (bookingForm) {
+    bookingForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        delayedPopup();
+    });
+}
