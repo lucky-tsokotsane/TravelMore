@@ -1,0 +1,152 @@
+# INTELLI_DOCORE_CUSTOMER_REPAIR_RUNNER_V1
+name: Intelli DoCore Customer Repair Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      tenant_id:
+        description: Intelli DoCore tenant ID
+        required: true
+        type: string
+      repair_id:
+        description: Intelli DoCore repair ID
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: intelli-docore-repair-${{ inputs.tenant_id }}
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    name: Validate Intelli DoCore repair
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out customer repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.13.0'
+
+      - name: Run customer-funded Intelli DoCore validation
+        env:
+          TENANT_ID: ${{ inputs.tenant_id }}
+          REPAIR_ID: ${{ inputs.repair_id }}
+          DOCTOR_CORE_API: https://intelli-docore.unimix-campus.workers.dev/api/doctor-core/external-run
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import {spawnSync} from 'node:child_process';
+
+          const api=process.env.DOCTOR_CORE_API;
+          const tenantId=process.env.TENANT_ID;
+          const repairId=process.env.REPAIR_ID;
+          const repository=process.env.GITHUB_REPOSITORY;
+          const runId=Number(process.env.GITHUB_RUN_ID);
+          const root=process.env.GITHUB_WORKSPACE;
+
+          function fail(message){throw new Error(message)}
+          function safePath(value){
+            const p=String(value||'').replace(/\\/g,'/').replace(/^\.\//,'');
+            return p&&!p.startsWith('/')&&!p.includes('..')&&!p.startsWith('.git/')&&!p.startsWith('.github/')&&!p.startsWith('.doctor-core/');
+          }
+          function countOccurrences(value,needle){let count=0,index=0;while((index=value.indexOf(needle,index))!==-1){count++;index+=Math.max(1,needle.length)}return count}
+          function safeCommand(command){return typeof command==='string'&&command.length<=220&&!/[;&|><`$\n\r]/.test(command)&&/^(node\s|npm\s|pnpm\s|yarn\s|bun\s|python3?\s|pytest(?:\s|$)|go\s+test(?:\s|$)|cargo\s+test(?:\s|$)|mvn\s|\.\/mvnw\s|gradle\s|\.\/gradlew\s)/.test(command.trim())}
+
+          async function oidc(){
+            let url=process.env.ACTIONS_ID_TOKEN_REQUEST_URL||'';
+            const token=process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN||'';
+            if(!url||!token)fail('GitHub Actions OIDC identity is unavailable.');
+            url+=(url.includes('?')?'&':'?')+'audience=doctor-core-external';
+            const response=await fetch(url,{headers:{Authorization:'bearer '+token}});
+            if(!response.ok)fail('Unable to obtain GitHub Actions OIDC identity.');
+            const body=await response.json();
+            if(!body.value)fail('GitHub Actions OIDC identity is missing.');
+            return body.value;
+          }
+          async function call(action,payload={}){
+            const identity=await oidc();
+            const response=await fetch(api,{method:'POST',headers:{Authorization:'Bearer '+identity,'Content-Type':'application/json'},body:JSON.stringify({action,tenantId,repository,repairId,runId,...payload})});
+            const body=await response.json().catch(()=>({}));
+            if(!response.ok)fail(body.error||('Intelli DoCore request failed: '+response.status));
+            return body;
+          }
+
+          try{
+            const exchange=await call('repair.customer.exchange');
+            if(!/^[0-9a-f]{40}$/i.test(exchange.baseSha||''))fail('Intelli DoCore returned an invalid repair base revision.');
+            const head=spawnSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'});
+            if(head.status!==0)fail('Unable to read customer repository revision.');
+            if(head.stdout.trim()!==exchange.baseSha){
+              const checkout=spawnSync('git',['checkout','--detach',exchange.baseSha],{cwd:root,encoding:'utf8',stdio:'inherit'});
+              if(checkout.status!==0)fail('The diagnosed repository revision is no longer available to this runner.');
+            }
+
+            const candidates=[...(exchange.diagnosis?.candidatePaths||[]),...(exchange.diagnosis?.evidence||[]).map(item=>item?.path)].filter(Boolean);
+            const sourceFiles=[];
+            for(const relative of [...new Set(candidates)].slice(0,24)){
+              if(typeof relative!=='string'||!safePath(relative))continue;
+              const absolute=path.resolve(root,relative);
+              if(!absolute.startsWith(path.resolve(root)+path.sep))continue;
+              try{const stat=fs.statSync(absolute);if(!stat.isFile()||stat.size>80000)continue;sourceFiles.push({path:relative,content:fs.readFileSync(absolute,'utf8')})}catch{}
+            }
+            if(!sourceFiles.length)fail('No diagnosis-approved source files were available to validate the repair.');
+
+            const prepared=await call('repair.customer.prepare',{sourceFiles});
+            const plan=prepared.plan;
+            if(!plan||!prepared.planToken||!Array.isArray(plan.changes)||!plan.changes.length)fail('Intelli DoCore did not return a bounded repair plan.');
+            for(const change of plan.changes){
+              if(!safePath(change.path))fail('Repair plan contains an unsafe path.');
+              const absolute=path.resolve(root,change.path);
+              let content=fs.readFileSync(absolute,'utf8');
+              for(const replacement of change.replacements||[]){
+                if(typeof replacement.find!=='string'||!replacement.find||typeof replacement.replace!=='string')fail('Repair plan contains an invalid replacement.');
+                if(countOccurrences(content,replacement.find)!==1)fail('Repair replacement anchor is not unique: '+change.path);
+                content=content.replace(replacement.find,replacement.replace);
+              }
+              fs.writeFileSync(absolute,content);
+            }
+
+            const diff=spawnSync('git',['diff','--name-only',exchange.baseSha,'--'],{cwd:root,encoding:'utf8'});
+            if(diff.status!==0)fail('Unable to inspect repair diff.');
+            const changedFiles=diff.stdout.split(/\r?\n/).filter(Boolean).sort();
+            const expected=[...(plan.changedFiles||[])].sort();
+            if(JSON.stringify(changedFiles)!==JSON.stringify(expected))fail('Repair changed files outside the signed plan.');
+            const numstat=spawnSync('git',['diff','--numstat',exchange.baseSha,'--'],{cwd:root,encoding:'utf8'});
+            if(numstat.status!==0)fail('Unable to measure repair diff.');
+            let diffLines=0;
+            for(const line of numstat.stdout.split(/\r?\n/).filter(Boolean)){const [a,b]=line.split(/\s+/);if(/^\d+$/.test(a))diffLines+=Number(a);if(/^\d+$/.test(b))diffLines+=Number(b)}
+            if(diffLines<1||diffLines>Number(exchange.maxDiffLines||0))fail('Repair diff exceeded the workspace limit.');
+
+            const validation=[];
+            const validationEnv={...process.env};
+            for(const key of ['ACTIONS_ID_TOKEN_REQUEST_TOKEN','ACTIONS_ID_TOKEN_REQUEST_URL','GITHUB_TOKEN','GH_TOKEN'])delete validationEnv[key];
+            for(const item of plan.validationCommands||[]){
+              if(!safeCommand(item.command))fail('Intelli DoCore returned an unsafe validation command.');
+              const started=Date.now();
+              const result=spawnSync(item.command,{cwd:root,encoding:'utf8',shell:true,timeout:120000,env:validationEnv,stdio:'pipe'});
+              validation.push({kind:item.kind||'check',command:item.command,status:result.status===0?'passed':result.error?.code==='ETIMEDOUT'?'timeout':'failed',durationMs:Date.now()-started});
+            }
+            if(validation.some(item=>item.status!=='passed'))fail('One or more approved validation commands failed.');
+
+            const completed=await call('repair.customer.validate',{plan,planToken:prepared.planToken,changedFiles,diffLines,validation});
+            console.log('Intelli DoCore repair PR:',completed.pullRequestUrl);
+          }catch(error){
+            const reason=String(error?.message||error||'Customer-funded repair validation failed.').slice(0,500);
+            try{await call('repair.customer.failed',{reason})}catch{}
+            console.error(reason);
+            process.exit(1);
+          }
+          NODE
